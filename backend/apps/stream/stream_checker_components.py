@@ -127,6 +127,13 @@ class StreamCheckConfig:
                 'https://www.google.com/generate_204',
                 'https://cloudflare.com/cdn-cgi/trace',
             ],
+        },
+        'provider_live_probe': {
+            'enabled': True,
+            'cache_ttl': 45,
+            'timeout': 10,
+            'retry_interval': 60,
+            'max_retries': 3,
         }
     }
     

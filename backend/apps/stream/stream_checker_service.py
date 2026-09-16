@@ -142,6 +142,7 @@ from apps.stream.stream_checker_components import (
     StreamCheckQueue,
     StreamCheckerProgress,
 )
+from apps.stream.provider_live_probe import get_live_slot_status, is_account_busy
 
 def _wait_for_udi_stream_count_stabilise(
     udi,
@@ -2319,8 +2320,8 @@ class StreamCheckerService:
 
         return results
 
-    @staticmethod
     def _initialize_provider_probe_account_inventory(
+        self,
         *,
         udi: Any,
         limiter: Any,
@@ -2422,6 +2423,33 @@ class StreamCheckerService:
             )
             return False
 
+        # ---- Provider live-connection pre-check guard ----
+        # Runs AFTER invalidation + publication so the invalidate-first
+        # contract holds (a missing/failed/malformed fetch can never reuse
+        # stale limits). Reuses the already-published `accounts` snapshot —
+        # no extra UDI fetch, no extra playlist refresh. Busy
+        # single-connection accounts get flagged; downstream probe paths
+        # skip them with reason provider_live_busy instead of hammering.
+        provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+        if provider_live_probe_cfg.get('enabled', True):
+            try:
+                for account in accounts:
+                    if not isinstance(account, dict):
+                        continue
+                    if account.get('max_streams', 0) <= 1:
+                        if is_account_busy(account, accounts):
+                            acct_name = account.get('name', 'unknown')
+                            logger.info(
+                                f"Account {acct_name} is busy "
+                                f"(provider_live_busy), skipping live probes"
+                            )
+                            account['_skip_live_busy'] = True
+            except Exception as e:
+                logger.warning(
+                    f"Provider live pre-check failed: {type(e).__name__}: {e}"
+                )
+        # ---- end live pre-check ----
+
         if not accounts:
             logger.info(
                 "%s continuing with an authoritative empty provider account "
@@ -2443,6 +2471,43 @@ class StreamCheckerService:
         profile, global-worker, viewer-preemption, URL-transformation, or abort
         behavior that applies to channel quality checks.
         """
+        # ---- NEW: Provider live-connection pre-check guard ----
+        # Before any capacity-limited probing, quickly check if accounts are
+        # live-busy. If so, skip that account's streams with a deferred reason
+        # instead of consuming slot after slot. This protects single-connection
+        # Xtream accounts while users are watching.
+        provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+        if provider_live_probe_cfg.get('enabled', True):
+            try:
+                get_accounts = getattr(udi, 'get_m3u_accounts', None)
+                if callable(get_accounts):
+                    all_accounts = get_accounts()
+                else:
+                    all_accounts = []
+            except Exception:
+                all_accounts = []
+
+            for account in all_accounts or []:
+                max_streams = account.get('max_streams', 0)
+                if max_streams <= 1:
+                    try:
+                        is_busy = is_account_busy(account, all_accounts)
+                        if is_busy:
+                            acct_name = account.get('name', 'unknown')
+                            logger.info(
+                                f"Account {acct_name} live-busy, "
+                                "deferring stream probes for this account"
+                            )
+                            # Mark account to skip; the limiter's existing
+                            # skip-reason plumbing will see _skip_live_busy
+                            if isinstance(account, dict):
+                                account['_skip_live_busy'] = True
+                    except Exception as e2:
+                        logger.debug(
+                            f"Live probe defer check error: {type(e2).__name__}: {e2}"
+                        )
+        # ---- end live pre-check ----
+
         from apps.stream.concurrent_stream_limiter import (
             get_account_limiter,
             get_smart_scheduler,
@@ -3753,6 +3818,65 @@ class StreamCheckerService:
                                   outer entry before connectivity preflight.
         """
         import time as time_module
+        
+        # ---- NEW: Provider live-connection pre-check guard ----
+        # Quick check if this channel's accounts are live-busy before proceeding.
+        # If busy, skip with provider_live_busy reason instead of hammering.
+        provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+        if provider_live_probe_cfg.get('enabled', True):
+            try:
+                udi = get_udi_manager()
+                all_accounts = udi.get_m3u_accounts() or []
+            except Exception:
+                all_accounts = []
+            
+            # Find accounts associated with this channel
+            channel_accounts = []
+            try:
+                channel = udi.get_channel_by_id(channel_id) if callable(getattr(udi, 'get_channel_by_id', None)) else None
+                if channel and isinstance(channel, dict):
+                    channel_streams = channel.get('streams', [])
+                    for stream_id in channel_streams:
+                        stream_data = udi.get_stream_by_id(stream_id) if callable(getattr(udi, 'get_stream_by_id', None)) else None
+                        if stream_data and isinstance(stream_data, dict):
+                            stream_acc_id = stream_data.get('m3u_account') or stream_data.get('m3u_account_id')
+                            if stream_acc_id:
+                                acc = udi.get_m3u_account_by_id(stream_acc_id) if callable(getattr(udi, 'get_m3u_account_by_id', None)) else None
+                                if acc and isinstance(acc, dict):
+                                    acc_max = acc.get('max_streams', 0)
+                                    if acc_max <= 1:
+                                        # Check if any stream in this channel uses this account
+                                        if any(
+                                            (s.get('m3u_account') or s.get('m3u_account_id')) == stream_acc_id
+                                            for s in (channel_streams or [])
+                                        ):
+                                            channel_accounts.append(acc)
+            except Exception:
+                pass
+            
+            for account in channel_accounts:
+                try:
+                    is_busy = is_account_busy(account)
+                    if is_busy:
+                        acct_name = account.get('name', 'unknown')
+                        logger.info(
+                            f"Channel {channel_id} account {acct_name} is live-busy, "
+                            "deferring concurrent probe"
+                        )
+                        # Return early with defer indication
+                        return {
+                            'success': True,
+                            'deferred': True,
+                            'defer_reason': 'provider_live_busy',
+                            'defer_account': account.get('name', 'unknown'),
+                            'channel_id': channel_id,
+                        }
+                except Exception as e3:
+                    logger.debug(
+                        f"Live probe defer check error for channel {channel_id}: {type(e3).__name__}: {e3}"
+                    )
+        # ---- end live pre-check ----
+
         from apps.stream.concurrent_stream_limiter import get_smart_scheduler, get_account_limiter, initialize_account_limits
 
         # One concurrent channel check owns the progress generation that was
@@ -4132,11 +4256,20 @@ class StreamCheckerService:
                     # 1. No new streams to analyze (all have been checked)
                     # 2. Stream count matches previous check (no additions/deletions)
                     # 3. Set of stream IDs is identical (no stream replacements)
+                    # 4. Assignment ORDER is identical (Teamarr sometimes re-adds the
+                    #    same streams worst-first; a pure order scramble must NOT
+                    #    skip - it falls through to the zero-probe re-sort below,
+                    #    since streams_to_check is empty here no ffmpeg probe runs).
                     previous_stream_count = len(checked_stream_ids)
                     current_stream_count = len(current_stream_ids)
-                    
-                    if (current_stream_count == previous_stream_count and 
-                        set(current_stream_ids) == set(checked_stream_ids)):
+                    assignment_order_changed = (
+                        [str(sid) for sid in current_stream_ids]
+                        != [str(sid) for sid in checked_stream_ids]
+                    )
+
+                    if (current_stream_count == previous_stream_count and
+                        set(current_stream_ids) == set(checked_stream_ids) and
+                        not assignment_order_changed):
                         logger.info(f"Channel {channel_name} unchanged since last check - skipping reorder")
                         # Update timestamp but keep existing checked_stream_ids
                         self._complete_channel_check(
@@ -4201,7 +4334,10 @@ class StreamCheckerService:
                             'checked_streams': cached_stats
                         }
                     else:
-                        logger.info(f"Channel composition changed (prev: {previous_stream_count}, curr: {current_stream_count}) - will reorder")
+                        if assignment_order_changed:
+                            logger.info(f"Channel {channel_name} assignment order changed since last check - will zero-probe re-sort")
+                        else:
+                            logger.info(f"Channel composition changed (prev: {previous_stream_count}, curr: {current_stream_count}) - will reorder")
 
             # ── stream_cache partition ──────────────────────────────────────
             # When caching is enabled, pull any stream whose last measurement is
@@ -9124,6 +9260,67 @@ class StreamCheckerService:
             # marker, not a potentially newer request for the same channel.
             force_check = True
         start_time = time_module.time()
+        
+        # ---- NEW: Provider live-connection pre-check guard ----
+        # Quick check if this channel's accounts are live-busy before proceeding.
+        # If busy, skip with provider_live_busy reason instead of hammering.
+        provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+        if provider_live_probe_cfg.get('enabled', True):
+            try:
+                udi = get_udi_manager()
+                all_accounts = udi.get_m3u_accounts() or []
+            except Exception:
+                all_accounts = []
+            
+            # Find accounts associated with this channel
+            channel_accounts = []
+            try:
+                channel = udi.get_channel_by_id(channel_id) if callable(getattr(udi, 'get_channel_by_id', None)) else None
+                if channel and isinstance(channel, dict):
+                    channel_streams = channel.get('streams', [])
+                    for stream_id in channel_streams:
+                        stream_data = udi.get_stream_by_id(stream_id) if callable(getattr(udi, 'get_stream_by_id', None)) else None
+                        if stream_data and isinstance(stream_data, dict):
+                            stream_acc_id = stream_data.get('m3u_account') or stream_data.get('m3u_account_id')
+                            if stream_acc_id:
+                                acc = udi.get_m3u_account_by_id(stream_acc_id) if callable(getattr(udi, 'get_m3u_account_by_id', None)) else None
+                                if acc and isinstance(acc, dict):
+                                    acc_max = acc.get('max_streams', 0)
+                                    if acc_max <= 1:
+                                        acc_username = acc.get('username') or ''
+                                        # Check if any stream in this channel uses this account
+                                        if any(
+                                            (s.get('m3u_account') or s.get('m3u_account_id')) == stream_acc_id
+                                            for s in (channel_streams or [])
+                                        ):
+                                            channel_accounts.append(acc)
+            except Exception:
+                pass
+            
+            for account in channel_accounts:
+                try:
+                    is_busy = is_account_busy(account)
+                    if is_busy:
+                        acct_name = account.get('name', 'unknown')
+                        logger.info(
+                            f"Channel {channel_id} account {acct_name} is live-busy, "
+                            "deferring single-channel probe"
+                        )
+                        # Return early with defer indication; the automation cycle
+                        # will handle the retry/backoff
+                        return {
+                            'success': True,
+                            'deferred': True,
+                            'defer_reason': 'provider_live_busy',
+                            'defer_account': account.get('name', 'unknown'),
+                            'channel_id': channel_id,
+                        }
+                except Exception as e3:
+                    logger.debug(
+                        f"Live probe defer check error for channel {channel_id}: {type(e3).__name__}: {e3}"
+                    )
+        # ---- end live pre-check ----
+
         udi = None
         operation_progress_generation = None
 
@@ -11062,6 +11259,20 @@ class StreamCheckerService:
                     schedule_changes.append(f"Enabled: {old_enabled} → {new_enabled}")
             if schedule_changes:
                 config_changes.append(f"Global check schedule: {', '.join(schedule_changes)}")
+        
+        # Sanitize stream_cache if present: coerce enabled to bool and
+        # ttl_hours to an int in [1, 720] (defaults to 48). Guards against
+        # null/NaN payloads from cleared number inputs persisting as null.
+        if 'stream_cache' in updates and isinstance(updates['stream_cache'], dict):
+            cache = updates['stream_cache']
+            if 'enabled' in cache:
+                cache['enabled'] = bool(cache['enabled'])
+            if 'ttl_hours' in cache:
+                try:
+                    ttl = int(cache['ttl_hours'])
+                except (TypeError, ValueError):
+                    ttl = 48
+                cache['ttl_hours'] = max(1, min(720, ttl))
         
         # Apply the configuration update
         self.config.update(updates)
