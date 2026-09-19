@@ -2898,11 +2898,54 @@ class SmartStreamScheduler:
                                 logger.info("Abort requested while waiting for provider capacity")
                                 return None
 
-                            # reserve_profile_for_stream_with_url is the
-                            # authoritative capacity and route check. Calling the
-                            # older UDI pre-check first can hide an incompatible
-                            # rewrite behind a generic capacity response.
+                            # Live-probe gate: for 1-connection providers an
+                            # external stream (user watching directly in their
+                            # player) consumes the only slot — Dispatcharr's
+                            # proxy status cannot see direct streams, so
+                            # consult the live probe here (45s cache keeps it
+                            # cheap; the shared busy store gives instant hits
+                            # from the inventory pre-check). Deliberately NOT
+                            # the UDIManager pre-check, whose profile-rewrite
+                            # verdict is reserved for try_start_probe below.
                             can_run, reason = (True, None)
+                            try:
+                                from apps.stream.provider_live_probe import (
+                                    is_account_id_live_busy,
+                                    is_account_busy,
+                                    set_account_live_busy,
+                                )
+                                if is_account_id_live_busy(account_id):
+                                    can_run, reason = False, 'provider_live_busy'
+                                else:
+                                    _udi_mgr = self.account_limiter.udi_manager
+                                    _all_accts = (
+                                        _udi_mgr.get_m3u_accounts() or []
+                                        if _udi_mgr is not None
+                                        else []
+                                    )
+                                    _acct = next(
+                                        (
+                                            a for a in _all_accts
+                                            if isinstance(a, dict)
+                                            and str(a.get('id')) == str(account_id)
+                                        ),
+                                        None,
+                                    )
+                                    if (
+                                        _acct is not None
+                                        and int(_acct.get('max_streams', 0) or 0) == 1
+                                        and str(_acct.get('server_url') or '').startswith('http')
+                                        and _acct.get('username')
+                                    ):
+                                        if is_account_busy(_acct, _all_accts):
+                                            can_run, reason = False, 'provider_live_busy'
+                                        else:
+                                            # Free again — clear a stale mark.
+                                            set_account_live_busy(account_id, False)
+                            except Exception as e:
+                                logger.debug(
+                                    f"Live-probe gate skipped for stream {stream['id']}: {e}"
+                                )
 
                             if can_run:
                                 started, reason, immediate_result = try_start_probe()
