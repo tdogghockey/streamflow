@@ -2436,7 +2436,19 @@ class StreamCheckerService:
                 for account in accounts:
                     if not isinstance(account, dict):
                         continue
-                    if account.get('max_streams', 0) <= 1:
+                    # Only guard accounts with a real 1-connection cap on an
+                    # http(s) provider. max_streams=0 means unlimited and
+                    # custom/local accounts consume no provider slots —
+                    # probing those only 404-spams Dispatcharr.
+                    try:
+                        _ms = int(account.get('max_streams', 0))
+                    except (TypeError, ValueError):
+                        _ms = 0
+                    if (
+                        _ms == 1
+                        and str(account.get('server_url') or '').startswith('http')
+                        and account.get('username')
+                    ):
                         if is_account_busy(account, accounts):
                             acct_name = account.get('name', 'unknown')
                             logger.info(
@@ -2488,8 +2500,18 @@ class StreamCheckerService:
                 all_accounts = []
 
             for account in all_accounts or []:
-                max_streams = account.get('max_streams', 0)
-                if max_streams <= 1:
+                # Only guard accounts with a real 1-connection cap on an
+                # http(s) provider; max_streams=0 is unlimited, custom/local
+                # accounts consume no provider slots.
+                try:
+                    max_streams = int(account.get('max_streams', 0))
+                except (TypeError, ValueError):
+                    max_streams = 0
+                if (
+                    max_streams == 1
+                    and str(account.get('server_url') or '').startswith('http')
+                    and account.get('username')
+                ):
                     try:
                         is_busy = is_account_busy(account, all_accounts)
                         if is_busy:

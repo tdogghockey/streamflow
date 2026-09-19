@@ -92,6 +92,9 @@ def get_live_slot_status(server_url: str, username: str, password: str) -> Dict[
         "username": username,
         "password": password,
     }
+    # Browser/player-style UA: some provider CDNs (Cloudflare) return 520 to
+    # the default python-requests UA, which would force fail-closed defers.
+    headers = {"User-Agent": "VLC/3.0.14"}
 
     # Sanitize for logging - never log raw password
     log_params = params.copy()
@@ -103,7 +106,7 @@ def get_live_slot_status(server_url: str, username: str, password: str) -> Dict[
     )
 
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=10, headers=headers)
         response.raise_for_status()
         data = response.json()
 
