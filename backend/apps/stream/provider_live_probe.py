@@ -31,6 +31,39 @@ _account_busy_cache: Dict[str, Tuple[float, bool]] = {}
 LIVE_PROBE_CACHE_TTL = 45
 ACCOUNT_BUSY_CACHE_TTL = 60
 
+# Live-busy account store: account ids currently confirmed busy by the
+# inventory pre-check. UDI account accessors return deep copies, so flags
+# set on account dicts never persist — the limiter must read this store
+# instead. In-memory only; reset on restart and re-evaluated each run.
+_live_busy_account_ids: set = set()
+
+
+def _normalize_account_key(account_id: Any) -> Optional[str]:
+    """Normalize an account id to a stable string key for the busy store."""
+    if account_id is None:
+        return None
+    try:
+        return str(int(account_id))
+    except (TypeError, ValueError):
+        return str(account_id) if account_id != "" else None
+
+
+def set_account_live_busy(account_id: Any, busy: bool) -> None:
+    """Mark/unmark an account id as live-busy in the shared store."""
+    key = _normalize_account_key(account_id)
+    if key is None:
+        return
+    if busy:
+        _live_busy_account_ids.add(key)
+    else:
+        _live_busy_account_ids.discard(key)
+
+
+def is_account_id_live_busy(account_id: Any) -> bool:
+    """Return True if the account id is currently marked live-busy."""
+    key = _normalize_account_key(account_id)
+    return key is not None and key in _live_busy_account_ids
+
 
 def _cache_key(server_url: str, username: str) -> Tuple[str, str]:
     """Create cache key from server_url and username."""

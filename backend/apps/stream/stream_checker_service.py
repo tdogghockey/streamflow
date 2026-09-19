@@ -142,7 +142,11 @@ from apps.stream.stream_checker_components import (
     StreamCheckQueue,
     StreamCheckerProgress,
 )
-from apps.stream.provider_live_probe import get_live_slot_status, is_account_busy
+from apps.stream.provider_live_probe import (
+    get_live_slot_status,
+    is_account_busy,
+    set_account_live_busy,
+)
 
 def _wait_for_udi_stream_count_stabilise(
     udi,
@@ -2455,7 +2459,12 @@ class StreamCheckerService:
                                 f"Account {acct_name} is busy "
                                 f"(provider_live_busy), skipping live probes"
                             )
-                            account['_skip_live_busy'] = True
+                            # Shared store: UDI accessors return deep copies,
+                            # so dict flags never persist — the limiter reads
+                            # this store instead.
+                            set_account_live_busy(account.get('id'), True)
+                        else:
+                            set_account_live_busy(account.get('id'), False)
             except Exception as e:
                 logger.warning(
                     f"Provider live pre-check failed: {type(e).__name__}: {e}"
@@ -2520,10 +2529,12 @@ class StreamCheckerService:
                                 f"Account {acct_name} live-busy, "
                                 "deferring stream probes for this account"
                             )
-                            # Mark account to skip; the limiter's existing
-                            # skip-reason plumbing will see _skip_live_busy
-                            if isinstance(account, dict):
-                                account['_skip_live_busy'] = True
+                            # Shared store: UDI accessors return deep copies,
+                            # so dict flags never persist — the limiter reads
+                            # this store instead.
+                            set_account_live_busy(account.get('id'), True)
+                        else:
+                            set_account_live_busy(account.get('id'), False)
                     except Exception as e2:
                         logger.debug(
                             f"Live probe defer check error: {type(e2).__name__}: {e2}"

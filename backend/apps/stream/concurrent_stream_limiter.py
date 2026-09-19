@@ -2642,6 +2642,7 @@ class SmartStreamScheduler:
                         'viewer_preempted': 'viewer_preempted',
                         'profile_url_incompatible': 'profile_url_incompatible',
                         'provider_profile_unavailable': 'provider_profile_unavailable',
+                        'provider_live_busy': 'provider_live_busy',
                     }.get(reason_detail, 'provider_capacity_unavailable')
                     return {
                         'stream_id': stream['id'],
@@ -2658,6 +2659,43 @@ class SmartStreamScheduler:
                 def check_stream_can_run() -> tuple[bool, Optional[str]]:
                     if not account_id or not self.account_limiter.udi_manager:
                         return (True, None)
+
+                    # Live-probe gate: for 1-connection providers an external
+                    # stream (e.g., the user watching directly in their player)
+                    # consumes the only slot — Dispatcharr's proxy status
+                    # cannot see direct streams, so consult the live probe
+                    # (45s cache keeps this cheap; the shared busy store gives
+                    # instant hits from the inventory pre-check).
+                    try:
+                        from apps.stream.provider_live_probe import (
+                            is_account_id_live_busy,
+                            is_account_busy,
+                            set_account_live_busy,
+                        )
+                        if is_account_id_live_busy(account_id):
+                            return (False, 'provider_live_busy')
+                        _udi_mgr = self.account_limiter.udi_manager
+                        _all_accts = _udi_mgr.get_m3u_accounts() or []
+                        _acct = next(
+                            (
+                                a for a in _all_accts
+                                if isinstance(a, dict)
+                                and str(a.get('id')) == str(account_id)
+                            ),
+                            None,
+                        )
+                        if (
+                            _acct is not None
+                            and int(_acct.get('max_streams', 0) or 0) == 1
+                            and str(_acct.get('server_url') or '').startswith('http')
+                            and _acct.get('username')
+                        ):
+                            if is_account_busy(_acct, _all_accts):
+                                return (False, 'provider_live_busy')
+                            # Free again — clear a stale busy mark.
+                            set_account_live_busy(account_id, False)
+                    except Exception as e:
+                        logger.debug(f"Live-probe gate skipped for stream {stream['id']}: {e}")
 
                     checker = getattr(self.account_limiter.udi_manager, 'check_stream_can_run', None)
                     if not callable(checker):
