@@ -9700,7 +9700,38 @@ class StreamCheckerService:
 
                 # Import here to allow better test mocking
                 from apps.core.api_utils import refresh_m3u_playlists
-                for account_id in m3u_refresh_account_ids:
+                # Live-probe gate: an M3U re-download pulls the FULL playlist
+                # from the provider edge that may also be serving a stream the
+                # user is watching directly in their player. That download
+                # competes with the live stream and causes micro-stutters.
+                # Skip re-downloads for busy accounts and proceed on the
+                # existing cache instead.
+                triggered_account_ids = list(m3u_refresh_account_ids)
+                provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+                if provider_live_probe_cfg.get('enabled', True):
+                    try:
+                        from apps.stream.provider_live_probe import is_account_busy as _acct_busy
+                        _all_accounts = udi.get_m3u_accounts() or []
+                        _by_id = {
+                            str(a.get('id')): a
+                            for a in _all_accounts
+                            if isinstance(a, dict)
+                        }
+                        triggered_account_ids = []
+                        for _aid in m3u_refresh_account_ids:
+                            _acct = _by_id.get(str(_aid))
+                            if _acct is None or not _acct_busy(_acct, _all_accounts):
+                                triggered_account_ids.append(_aid)
+                            else:
+                                logger.info(
+                                    f"Account {_acct.get('name')} busy "
+                                    f"(provider_live_busy) — skipping M3U "
+                                    "re-download; using existing cache"
+                                )
+                    except Exception as _lp_err:
+                        logger.debug(f"Live-probe M3U gate failed: {_lp_err}")
+                        triggered_account_ids = list(m3u_refresh_account_ids)
+                for account_id in triggered_account_ids:
                     abort_result = self._abort_channel_check_if_requested(
                         channel_id,
                         channel_name,
@@ -9711,35 +9742,41 @@ class StreamCheckerService:
                     logger.info(f"Refreshing M3U account {account_id}")
                     refresh_m3u_playlists(account_id=account_id)
 
-                logger.info(
-                    "✓ Playlist refresh triggered — waiting for Dispatcharr to process..."
-                )
-                # Calibrate poll timeout to 115% of the last known refresh_all()
-                # duration, with a floor of 5s for single channel checks (which
-                # are user-triggered and must feel responsive) or 60s for
-                # automation cycles (which run unattended and can afford to wait).
-                _known_duration = udi.get_last_refresh_duration()
-                if not isinstance(_known_duration, (int, float)):
-                    _known_duration = 0
-                _floor = 5
-                _poll_timeout = max(_floor, int(_known_duration * 1.15)) if _known_duration > 0 else _floor
-                logger.debug(
-                    f"Post-refresh poll timeout: {_poll_timeout}s "
-                    f"(115% of last refresh duration {_known_duration:.0f}s, floor {_floor}s)"
-                )
-                _wait_for_udi_stream_count_stabilise(
-                    udi,
-                    pre_refresh_stream_count,
-                    timeout=_poll_timeout,
-                    abort_event=self.abort_current_check,
-                )
-                abort_result = self._abort_channel_check_if_requested(
-                    channel_id,
-                    channel_name,
-                    queue_entry_token=_queue_entry_token,
-                )
-                if abort_result:
-                    return abort_result
+                if triggered_account_ids:
+                    logger.info(
+                        "✓ Playlist refresh triggered — waiting for Dispatcharr to process..."
+                    )
+                    # Calibrate poll timeout to 115% of the last known refresh_all()
+                    # duration, with a floor of 5s for single channel checks (which
+                    # are user-triggered and must feel responsive) or 60s for
+                    # automation cycles (which run unattended and can afford to wait).
+                    _known_duration = udi.get_last_refresh_duration()
+                    if not isinstance(_known_duration, (int, float)):
+                        _known_duration = 0
+                    _floor = 5
+                    _poll_timeout = max(_floor, int(_known_duration * 1.15)) if _known_duration > 0 else _floor
+                    logger.debug(
+                        f"Post-refresh poll timeout: {_poll_timeout}s "
+                        f"(115% of last refresh duration {_known_duration:.0f}s, floor {_floor}s)"
+                    )
+                    _wait_for_udi_stream_count_stabilise(
+                        udi,
+                        pre_refresh_stream_count,
+                        timeout=_poll_timeout,
+                        abort_event=self.abort_current_check,
+                    )
+                    abort_result = self._abort_channel_check_if_requested(
+                        channel_id,
+                        channel_name,
+                        queue_entry_token=_queue_entry_token,
+                    )
+                    if abort_result:
+                        return abort_result
+                else:
+                    logger.info(
+                        "All M3U refreshes skipped (provider_live_busy) — "
+                        "provider in use; keeping existing cache state"
+                    )
 
                 # Sync UDI cache from Dispatcharr's now-updated stream pool.
                 #
