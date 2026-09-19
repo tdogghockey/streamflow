@@ -146,6 +146,7 @@ from apps.stream.provider_live_probe import (
     get_live_slot_status,
     is_account_busy,
     set_account_live_busy,
+    is_account_id_live_busy,
 )
 
 def _wait_for_udi_stream_count_stabilise(
@@ -3876,8 +3877,11 @@ class StreamCheckerService:
                             if stream_acc_id:
                                 acc = udi.get_m3u_account_by_id(stream_acc_id) if callable(getattr(udi, 'get_m3u_account_by_id', None)) else None
                                 if acc and isinstance(acc, dict):
-                                    acc_max = acc.get('max_streams', 0)
-                                    if acc_max <= 1:
+                                    try:
+                                        acc_max = int(acc.get('max_streams', 0))
+                                    except (TypeError, ValueError):
+                                        acc_max = 0
+                                    if acc_max == 1:
                                         # Check if any stream in this channel uses this account
                                         if any(
                                             (s.get('m3u_account') or s.get('m3u_account_id')) == stream_acc_id
@@ -3889,7 +3893,14 @@ class StreamCheckerService:
             
             for account in channel_accounts:
                 try:
-                    is_busy = is_account_busy(account)
+                    # Shared busy store first (instant, no probe): another
+                    # check's inventory pre-check may have already confirmed
+                    # the provider busy. Fall back to the live probe (45s
+                    # cache) for a fresh verdict.
+                    if is_account_id_live_busy(account.get('id')):
+                        is_busy = True
+                    else:
+                        is_busy = is_account_busy(account, all_accounts)
                     if is_busy:
                         acct_name = account.get('name', 'unknown')
                         logger.info(
@@ -3901,7 +3912,7 @@ class StreamCheckerService:
                             'success': True,
                             'deferred': True,
                             'defer_reason': 'provider_live_busy',
-                            'defer_account': account.get('name', 'unknown'),
+                            'defer_account': acct_name,
                             'channel_id': channel_id,
                         }
                 except Exception as e3:
@@ -9318,8 +9329,11 @@ class StreamCheckerService:
                             if stream_acc_id:
                                 acc = udi.get_m3u_account_by_id(stream_acc_id) if callable(getattr(udi, 'get_m3u_account_by_id', None)) else None
                                 if acc and isinstance(acc, dict):
-                                    acc_max = acc.get('max_streams', 0)
-                                    if acc_max <= 1:
+                                    try:
+                                        acc_max = int(acc.get('max_streams', 0))
+                                    except (TypeError, ValueError):
+                                        acc_max = 0
+                                    if acc_max == 1:
                                         acc_username = acc.get('username') or ''
                                         # Check if any stream in this channel uses this account
                                         if any(
@@ -9332,7 +9346,14 @@ class StreamCheckerService:
             
             for account in channel_accounts:
                 try:
-                    is_busy = is_account_busy(account)
+                    # Shared busy store first (instant, no probe): another
+                    # check's inventory pre-check may have already confirmed
+                    # the provider busy. Fall back to the live probe (45s
+                    # cache) for a fresh verdict.
+                    if is_account_id_live_busy(account.get('id')):
+                        is_busy = True
+                    else:
+                        is_busy = is_account_busy(account, all_accounts)
                     if is_busy:
                         acct_name = account.get('name', 'unknown')
                         logger.info(
@@ -9345,7 +9366,7 @@ class StreamCheckerService:
                             'success': True,
                             'deferred': True,
                             'defer_reason': 'provider_live_busy',
-                            'defer_account': account.get('name', 'unknown'),
+                            'defer_account': acct_name,
                             'channel_id': channel_id,
                         }
                 except Exception as e3:

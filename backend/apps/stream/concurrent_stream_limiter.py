@@ -2970,6 +2970,13 @@ class SmartStreamScheduler:
                             if wait_reason in {
                                 'profile_url_incompatible',
                                 'provider_profile_unavailable',
+                                # Live-busy: the user is watching on a
+                                # 1-connection provider — waiting cannot open
+                                # the slot, so skip instantly with cached
+                                # stats instead of burning provider_wait_timeout
+                                # per stream. The deferred queue re-checks when
+                                # the provider frees up.
+                                'provider_live_busy',
                             }:
                                 result = provider_wait_result(wait_reason)
                                 return result
