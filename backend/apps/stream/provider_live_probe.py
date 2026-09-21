@@ -120,34 +120,72 @@ def get_live_slot_status(server_url: str, username: str, password: str) -> Dict[
             )
             return cache_result
 
-    url = f"{server_url}/player_api.php"
-    params = {
-        "username": username,
-        "password": password,
-    }
     # Browser/player-style UA: some provider CDNs (Cloudflare) return 520 to
     # the default python-requests UA, which would force fail-closed defers.
-    headers = {"User-Agent": "VLC/3.0.14"}
+    user_agent = "VLC/3.0.14"
 
     # Sanitize for logging - never log raw password
-    log_params = params.copy()
-    if "password" in log_params:
-        log_params["password"] = _redact_password(log_params["password"])
-
+    log_params = {"username": username, "password": _redact_password(password)}
     logger.debug(
-        f"Probing live slot at {url} with params {log_params}"
+        f"Probing live slot at {server_url}/player_api.php with params {log_params}"
     )
 
     try:
-        response = requests.get(url, params=params, timeout=10, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+        import json as _json
 
-        # Parse string ints safely - player_api returns strings
-        active_cons = int(data.get("active_cons", "0") or 0)
-        max_connections = int(data.get("max_connections", "0") or 0)
-        auth = data.get("auth", "")
-        status = data.get("status", "unknown")
+        data = None
+        # Primary: curl subprocess. The provider CDN intermittently blocks
+        # python-requests' TLS fingerprint (520/513) while curl passes
+        # consistently. curl ships in the container and subprocess overhead
+        # is negligible at the 45s cache cadence. Creds are URL-encoded and
+        # passed as a single argv (no shell) and never logged.
+        try:
+            from urllib.parse import quote_plus
+            import subprocess
+
+            full_url = (
+                f"{server_url}/player_api.php"
+                f"?username={quote_plus(str(username))}"
+                f"&password={quote_plus(str(password))}"
+            )
+            proc = subprocess.run(
+                ["curl", "-s", "--max-time", "10", "-A", user_agent, full_url],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"curl exit code {proc.returncode}")
+            data = _json.loads(proc.stdout)
+        except (FileNotFoundError, ModuleNotFoundError):
+            # curl unavailable — fall back to requests
+            import requests as _requests
+
+            response = _requests.get(
+                f"{server_url}/player_api.php",
+                params={"username": username, "password": password},
+                timeout=10,
+                headers={"User-Agent": user_agent},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        # Parse string ints safely - player_api returns strings, and the
+        # connection fields live NESTED under user_info (NOT top level).
+        user_info = (
+            data.get("user_info")
+            if isinstance(data, dict) and isinstance(data.get("user_info"), dict)
+            else None
+        )
+        if user_info is None:
+            # Not a recognisable player_api payload — fail closed via the
+            # outer handler instead of reading empty defaults as a real
+            # "0 max connections" verdict (which forces permanent busy).
+            raise ValueError("player_api response missing user_info")
+        active_cons = int(user_info.get("active_cons", "0") or 0)
+        max_connections = int(user_info.get("max_connections", "0") or 0)
+        auth = user_info.get("auth", "")
+        status = user_info.get("status", "unknown")
 
         result = {
             "active_cons": active_cons,
