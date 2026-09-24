@@ -84,7 +84,12 @@ def _is_cache_valid(timestamp: float, ttl: float) -> bool:
     return time.time() - timestamp < ttl
 
 
-def get_live_slot_status(server_url: str, username: str, password: str) -> Dict[str, Any]:
+def get_live_slot_status(
+    server_url: str,
+    username: str,
+    password: str,
+    ttl: float = LIVE_PROBE_CACHE_TTL,
+) -> Dict[str, Any]:
     """
     Get live slot status for an Xtream account via player_api.php.
 
@@ -114,7 +119,7 @@ def get_live_slot_status(server_url: str, username: str, password: str) -> Dict[
     # Check cache
     if cache_key in _live_probe_cache:
         cache_ts, cache_result = _live_probe_cache[cache_key]
-        if _is_cache_valid(cache_ts, LIVE_PROBE_CACHE_TTL):
+        if _is_cache_valid(cache_ts, ttl):
             logger.debug(
                 f"Live probe cache hit for ({server_url}, {username})"
             )
@@ -253,6 +258,7 @@ def _find_mirror_accounts(
 def is_account_busy(
     m3u_account: Dict[str, Any],
     all_accounts: Optional[List[Dict[str, Any]]] = None,
+    ttl: float = LIVE_PROBE_CACHE_TTL,
 ) -> bool:
     """
     Check if an M3U account is busy by probing all mirror URLs.
@@ -356,7 +362,7 @@ def is_account_busy(
         mirror_username = mirror_account.get("username") or username
 
         # Probe the mirror's live slot status
-        status = get_live_slot_status(mirror_url, mirror_username, creds_password)
+        status = get_live_slot_status(mirror_url, mirror_username, creds_password, ttl=ttl)
 
         if status.get("unknown"):
             # Probe failed - assume this mirror busy, continue checking others
@@ -388,7 +394,9 @@ def is_account_busy(
         if active_cons < max_conns:
             # This mirror has a free slot
             free_found = True
-            logger.info(
+            # DEBUG not INFO: the limiter wait-loop polls this every 0.5s —
+            # INFO would spam ~120 lines/min per account during waits.
+            logger.debug(
                 f"Mirror {mirror_url} has free slot "
                 f"(active_cons={active_cons} < max_connections={max_conns})"
             )

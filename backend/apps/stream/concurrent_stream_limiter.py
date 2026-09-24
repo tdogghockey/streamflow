@@ -2690,7 +2690,7 @@ class SmartStreamScheduler:
                             and str(_acct.get('server_url') or '').startswith('http')
                             and _acct.get('username')
                         ):
-                            if is_account_busy(_acct, _all_accts):
+                            if is_account_busy(_acct, _all_accts, ttl=10):
                                 return (False, 'provider_live_busy')
                             # Free again — clear a stale busy mark.
                             set_account_live_busy(account_id, False)
@@ -2937,7 +2937,7 @@ class SmartStreamScheduler:
                                         and str(_acct.get('server_url') or '').startswith('http')
                                         and _acct.get('username')
                                     ):
-                                        if is_account_busy(_acct, _all_accts):
+                                        if is_account_busy(_acct, _all_accts, ttl=10):
                                             can_run, reason = False, 'provider_live_busy'
                                         else:
                                             # Free again — clear a stale mark.
