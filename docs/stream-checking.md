@@ -219,6 +219,113 @@ is `grace_period`.
 
 ---
 
+## Provider live probe (single-connection guard)
+
+For M3U accounts with a **1-connection provider limit** (`max_streams: 1` on an
+Xtream-type account), StreamFlow checks the provider's live connection state
+before any probe or playlist work touches that account. The goal: when someone
+is watching a stream from that provider (directly in their player), automated
+checks must not open a competing connection and disrupt live playback.
+
+Enable it at `Stream Checker -> Stream Checker Configuration -> Edit`; the
+corresponding config block is:
+
+```json
+{
+  "provider_live_probe": {
+    "enabled": true,
+    "cache_ttl": 45,
+    "timeout": 10,
+    "retry_interval": 60,
+    "max_retries": 3
+  }
+}
+```
+
+### How it works
+
+- **Probe endpoint** — `GET {server}/player_api.php?username=…&password=…`
+  returns `user_info.active_cons` and `user_info.max_connections` (string-encoded
+  ints, nested under `user_info`, not top level). This request never consumes a
+  stream slot.
+- **HTTP layer** — the probe shells out to `curl` (`User-Agent: VLC/3.0.14`)
+  rather than python-requests. Some provider CDNs (Cloudflare) intermittently
+  block python-requests' TLS fingerprint with 520/513 errors; curl passes
+  consistently. If `curl` is unavailable the probe falls back to requests.
+- **Fail closed** — an unavailable, malformed, or unrecognizable response is
+  treated as busy (never as a confirmed "0 connections"), so a broken probe
+  cannot open the scheduler while a viewer may be present. The account limiter
+  still decides admission with its own capacity checks.
+- **Mirror accounts** — accounts sharing one username (failover hosts pointing
+  at different provider URLs) are grouped: **any mirror free = free**, all
+  mirrors busy/unknown = busy. Credentials come from the UDI account data.
+- **Shared busy store** — UDI account accessors return deep copies, so
+  busy/unbusy state is kept in a module-level store
+  (`apps/stream/provider_live_probe.py`) that every check path reads. It is
+  re-evaluated on each run's inventory initialization and cleared when a probe
+  confirms a free slot.
+- **Fresh verdicts** — the per-stream probe gate uses a 10-second TTL (instead
+  of the 45s cache) so a viewer starting to watch — or reconnecting after a
+  drop — is detected within 10 seconds instead of after a full cache window.
+  This prevents the kick/oscillation spiral where a stale "free" verdict lets a
+  probe start just as the viewer's connection returns.
+
+### What gets deferred
+
+When the provider reports busy:
+
+- The account's stream probes are **skipped instantly** (reason
+  `provider_live_busy`) with any cached stats attached — no
+  `provider_wait_timeout` is burned per stream.
+- Channel-level pre-checks (`check_single_channel` and `_check_channel_concurrent`)
+  consult the shared busy store first and defer the **whole channel** before any
+  analysis starts.
+- M3U playlist re-downloads for the account are skipped (a full playlist fetch
+  competes with the live stream on the same provider edge).
+- Scheduled UDI refresh ticks skip while the provider is busy.
+- Checks resume automatically once a probe confirms a free slot.
+
+### Where it is enforced
+
+The gate runs on every path that could open a provider connection or trigger a
+provider-side fetch:
+
+- `_initialize_provider_probe_account_inventory` (inventory publication)
+- `_run_capacity_limited_stream_probes` (all capacity-limited probes)
+- `check_single_channel` / `_check_channel_concurrent` (channel pre-checks)
+- The limiter's per-stream `check_stream_can_run` gate (fresh 10s verdict
+  immediately before each probe)
+- The M3U playlist refresh step inside channel checks
+- The scheduled UDI refresh worker
+
+### Limits of the design
+
+- **Direct-player connections are only visible via the provider.** Dispatcharr's
+  proxy status cannot see streams a player opens directly against the provider,
+  so the probe is the only signal. Backing out of a player app does not close
+  the connection — fully close the app (force stop) when done watching, or the
+  provider keeps counting the slot and checks stay deferred for a few minutes.
+- **Stale provider slots** — some providers keep counting a closed connection
+  for minutes after a non-graceful disconnect. During that window checks defer
+  even though nothing is playing; they self-heal once the probe reports
+  `active_cons: 0`.
+- The guard only applies to accounts with a real 1-connection cap
+  (`max_streams: 1`) on an http(s) provider. Unlimited accounts (`0`) and
+  custom/local accounts consume no provider slots and are never probed.
+
+### Observability
+
+- Busy defers: `Account <name> is busy (provider_live_busy), skipping live probes`
+  and `Channel <id> account <name> is live-busy, deferring …`
+- Skipped streams carry `skipped_reason: provider_live_busy` /
+  `defer_reason: provider_live_busy` in check results and progress details.
+- Probe failures log `Live probe failed for (<server>, <user>)` at WARNING with
+  the exception type; credentials are redacted in all probe logs.
+- Free-slot verdicts log at DEBUG only (`Mirror <url> has free slot …`) to avoid
+  spamming the wait-loop poll cadence.
+
+---
+
 ## Concurrent checking
 
 Concurrent stream probes are handled inside the stream checker service with
