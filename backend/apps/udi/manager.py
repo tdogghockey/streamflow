@@ -31,7 +31,7 @@ import time
 import requests
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set, Tuple
 
@@ -220,6 +220,14 @@ class UDIManager:
         # Last run timestamp for the scheduled UDI refresh worker.
         # In-memory only — resets on restart, which is correct behaviour.
         self._udi_refresh_last_run: Optional[datetime] = None
+
+        # Assignment-change trigger state (Teamarr-side reassignments).
+        # refresh_delta() sets _delta_stream_change_pending when it sees
+        # stream add/delete; the refresh worker consumes it
+        # (cooldown-guarded) to run an early full re-sync + queue the
+        # affected channels. In-memory only — resets on restart.
+        self._delta_stream_change_pending: bool = False
+        self._last_assignment_resync_at: Optional[datetime] = None
 
         # Re-entrant because account-authority leases deliberately keep this
         # lock held while consumers may perform read-only UDI helper calls.
@@ -1549,6 +1557,101 @@ class UDIManager:
         finally:
             self.clear_automation_busy()
 
+    # ── Teamarr reassignment trigger ──────────────────────────────
+    # refresh_delta() detects add/delete events cheaply but never maps them
+    # to channels (channel.streams lists only re-sync on refresh_all()).
+    # These helpers let the refresh worker turn "Dispatcharr changed" into
+    # "check exactly the affected channels, right away":
+    #   * snapshot_channel_assignments() captures per-channel order cheaply.
+    #   * queue_assignment_changed_channels() diffs a snapshot vs now and
+    #     queues changed channels WITHOUT force (incremental: only new
+    #     streams probe; order scrambles re-sort via the zero-probe path).
+    #   * refresh_delta() raises _delta_stream_change_pending on stream
+    #     add/delete; the worker consumes it (cooldown-guarded) to run an
+    #     early full re-sync instead of waiting up to 180 min for the slot.
+
+    def snapshot_channel_assignments(self) -> Dict[int, List[int]]:
+        """Capture current per-channel stream assignment order (cheap)."""
+        with self._lock:
+            return {
+                cid: list(ch.get('streams') or [])
+                for cid, ch in self._channels_by_id.items()
+            }
+
+    def queue_assignment_changed_channels(
+        self,
+        before: Dict[int, List[int]],
+        *,
+        reason: str,
+        max_channels: int = 30,
+    ) -> int:
+        """Diff a pre-refresh snapshot vs now; queue changed channels.
+
+        Fails soft: any error is logged and 0 is returned — refresh flows
+        must never break because queuing failed.
+        """
+        try:
+            after = self.snapshot_channel_assignments()
+            changed = [
+                cid for cid, old in before.items()
+                if cid in after and (
+                    len(after[cid]) != len(old)
+                    or [str(s) for s in after[cid]] != [str(s) for s in old]
+                )
+            ]
+            # Brand-new channels also need an initial check.
+            changed += [cid for cid in after if cid not in before]
+            if not changed:
+                return 0
+            from apps.stream.stream_checker_service import get_stream_checker_service
+            checker = get_stream_checker_service()
+            queued = 0
+            for cid in changed[:max_channels]:
+                try:
+                    if checker.queue_channel(
+                        int(cid),
+                        priority=10,
+                        force_check=False,
+                        metadata={"source": "udi_assignment_resync", "reason": reason},
+                    ):
+                        queued += 1
+                except Exception as exc:
+                    logger.debug(
+                        "Could not queue channel %s after assignment change: %s",
+                        cid, exc,
+                    )
+            if len(changed) > max_channels:
+                logger.warning(
+                    "Assignment resync: %s channels changed, queued first %s; "
+                    "remainder defer to scheduled runs",
+                    len(changed), max_channels,
+                )
+            else:
+                logger.info(
+                    "Assignment resync (%s): queued %s channel(s) for reorder check",
+                    reason, queued,
+                )
+            self._last_assignment_resync_at = datetime.now()
+            return queued
+        except Exception as exc:
+            logger.debug("Assignment-resync queue failed (non-fatal): %s", exc)
+            return 0
+
+    def consume_delta_assignment_signal(self, cooldown_minutes: int = 15) -> bool:
+        """One-shot signal for the refresh worker after delta stream changes.
+
+        Returns True (and clears the flag) when refresh_delta() saw stream
+        add/delete AND no resync ran within cooldown_minutes. The flag is
+        kept (not cleared) while cooling down so the signal isn't lost.
+        """
+        if not self._delta_stream_change_pending:
+            return False
+        last = self._last_assignment_resync_at
+        if last is not None and datetime.now() - last < timedelta(minutes=cooldown_minutes):
+            return False
+        self._delta_stream_change_pending = False
+        return True
+
     def refresh_delta(self) -> bool:
         """Incremental refresh: detect and apply stream/channel structural changes.
 
@@ -1584,7 +1687,10 @@ class UDIManager:
         current_ids = self.fetcher.fetch_all_ids()
         if not current_ids:
             logger.warning("Delta refresh: /ids/ endpoints unreachable, falling back to full refresh")
-            return self.refresh_all()
+            _assign_snap = self.snapshot_channel_assignments()
+            _assign_res = self.refresh_all()
+            self.queue_assignment_changed_channels(_assign_snap, reason="delta-fallback")
+            return _assign_res
 
         dispatcharr_stream_ids:  Set[int] = current_ids.get('streams',  set())
         dispatcharr_channel_ids: Set[int] = current_ids.get('channels', set())
@@ -1606,6 +1712,13 @@ class UDIManager:
         stream_change_ratio  = (len(added_stream_ids)  + len(deleted_stream_ids))  / max(len(dispatcharr_stream_ids),  1)
         channel_change_ratio = (len(added_channel_ids) + len(deleted_channel_ids)) / max(len(dispatcharr_channel_ids), 1)
 
+        if added_stream_ids or deleted_stream_ids:
+            # Teamarr-side change (new/removed streams). Channel.streams
+            # lists only re-sync on refresh_all(), so raise the signal for
+            # the worker to run an early re-sync + queue affected channels
+            # instead of waiting up to 180 min for the scheduled slot.
+            self._delta_stream_change_pending = True
+
         logger.info(
             f"Delta: streams +{len(added_stream_ids)} -{len(deleted_stream_ids)} "
             f"({stream_change_ratio:.1%}), "
@@ -1620,7 +1733,10 @@ class UDIManager:
                 f"Delta too large (streams {stream_change_ratio:.1%}, "
                 f"channels {channel_change_ratio:.1%}) — falling back to full refresh"
             )
-            return self.refresh_all()
+            _assign_snap = self.snapshot_channel_assignments()
+            _assign_res = self.refresh_all()
+            self.queue_assignment_changed_channels(_assign_snap, reason="delta-fallback")
+            return _assign_res
 
         if not any([
             added_stream_ids,

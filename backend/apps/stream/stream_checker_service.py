@@ -2474,7 +2474,7 @@ class StreamCheckerService:
         # no extra UDI fetch, no extra playlist refresh. Busy
         # single-connection accounts get flagged; downstream probe paths
         # skip them with reason provider_live_busy instead of hammering.
-        provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+        provider_live_probe_cfg = (getattr(self, 'config', None) or {}).get('provider_live_probe', {})
         if provider_live_probe_cfg.get('enabled', True):
             try:
                 for account in accounts:
@@ -2532,55 +2532,6 @@ class StreamCheckerService:
         profile, global-worker, viewer-preemption, URL-transformation, or abort
         behavior that applies to channel quality checks.
         """
-        # ---- NEW: Provider live-connection pre-check guard ----
-        # Before any capacity-limited probing, quickly check if accounts are
-        # live-busy. If so, skip that account's streams with a deferred reason
-        # instead of consuming slot after slot. This protects single-connection
-        # Xtream accounts while users are watching.
-        provider_live_probe_cfg = self.config.get('provider_live_probe', {})
-        if provider_live_probe_cfg.get('enabled', True):
-            try:
-                get_accounts = getattr(udi, 'get_m3u_accounts', None)
-                if callable(get_accounts):
-                    all_accounts = get_accounts()
-                else:
-                    all_accounts = []
-            except Exception:
-                all_accounts = []
-
-            for account in all_accounts or []:
-                # Only guard accounts with a real 1-connection cap on an
-                # http(s) provider; max_streams=0 is unlimited, custom/local
-                # accounts consume no provider slots.
-                try:
-                    max_streams = int(account.get('max_streams', 0))
-                except (TypeError, ValueError):
-                    max_streams = 0
-                if (
-                    max_streams == 1
-                    and str(account.get('server_url') or '').startswith('http')
-                    and account.get('username')
-                ):
-                    try:
-                        is_busy = is_account_busy(account, all_accounts)
-                        if is_busy:
-                            acct_name = account.get('name', 'unknown')
-                            logger.info(
-                                f"Account {acct_name} live-busy, "
-                                "deferring stream probes for this account"
-                            )
-                            # Shared store: UDI accessors return deep copies,
-                            # so dict flags never persist — the limiter reads
-                            # this store instead.
-                            set_account_live_busy(account.get('id'), True)
-                        else:
-                            set_account_live_busy(account.get('id'), False)
-                    except Exception as e2:
-                        logger.debug(
-                            f"Live probe defer check error: {type(e2).__name__}: {e2}"
-                        )
-        # ---- end live pre-check ----
-
         from apps.stream.concurrent_stream_limiter import (
             get_account_limiter,
             get_smart_scheduler,
@@ -3895,7 +3846,7 @@ class StreamCheckerService:
         # ---- NEW: Provider live-connection pre-check guard ----
         # Quick check if this channel's accounts are live-busy before proceeding.
         # If busy, skip with provider_live_busy reason instead of hammering.
-        provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+        provider_live_probe_cfg = (getattr(self, 'config', None) or {}).get('provider_live_probe', {})
         if provider_live_probe_cfg.get('enabled', True):
             try:
                 udi = get_udi_manager()
@@ -9410,7 +9361,7 @@ class StreamCheckerService:
         # ---- NEW: Provider live-connection pre-check guard ----
         # Quick check if this channel's accounts are live-busy before proceeding.
         # If busy, skip with provider_live_busy reason instead of hammering.
-        provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+        provider_live_probe_cfg = (getattr(self, 'config', None) or {}).get('provider_live_probe', {})
         if provider_live_probe_cfg.get('enabled', True):
             try:
                 udi = get_udi_manager()
@@ -9841,7 +9792,7 @@ class StreamCheckerService:
                 # Skip re-downloads for busy accounts and proceed on the
                 # existing cache instead.
                 triggered_account_ids = list(m3u_refresh_account_ids)
-                provider_live_probe_cfg = self.config.get('provider_live_probe', {})
+                provider_live_probe_cfg = (getattr(self, 'config', None) or {}).get('provider_live_probe', {})
                 if provider_live_probe_cfg.get('enabled', True):
                     try:
                         from apps.stream.provider_live_probe import is_account_busy as _acct_busy

@@ -244,6 +244,37 @@ def udi_refresh_processor_loop(
             except Exception as _sc_err:
                 logger.debug(f"Could not check stream checking mode: {_sc_err}")
 
+            # Guard: skip the ENTIRE tick if any single-connection provider is
+            # live-busy. For 1-slot Xtream accounts, a running stream must not
+            # be disrupted by UDI refresh work (playlist/stream fetches go
+            # through the same provider edge serving the live stream).
+            try:
+                from apps.stream.provider_live_probe import is_account_busy
+                all_accts = udi.get_m3u_accounts() if udi else []
+                busy_providers = []
+                for acct in all_accts:
+                    # Only guard accounts with a real 1-connection cap;
+                    # max_streams=0 is unlimited and consumes no slots.
+                    try:
+                        max_s = int(acct.get('max_streams', 0))
+                    except (TypeError, ValueError):
+                        max_s = 0
+                    if (
+                        max_s == 1
+                        and str(acct.get('server_url') or '').startswith('http')
+                        and acct.get('username')
+                    ):
+                        if is_account_busy(acct, all_accts):
+                            busy_providers.append(acct.get('name'))
+                if busy_providers:
+                    logger.debug(
+                        "UDI refresh skipping tick — provider(s) live-busy: "
+                        f"{busy_providers}"
+                    )
+                    continue
+            except Exception as _probe_err:
+                logger.debug(f"Could not check provider live state: {_probe_err}")
+
             last_run = udi.get_udi_refresh_last_run()
 
             if _is_schedule_due(schedule, last_run):
@@ -252,7 +283,12 @@ def udi_refresh_processor_loop(
                     f"Scheduled full UDI refresh firing "
                     f"(schedule: {schedule.get('type')} {schedule.get('value')})..."
                 )
+                _assign_snap = udi.snapshot_channel_assignments()
                 success = udi.refresh_all()
+                if success:
+                    udi.queue_assignment_changed_channels(
+                        _assign_snap, reason="scheduled-full-refresh"
+                    )
                 if success:
                     udi.set_udi_refresh_last_run()
                     logger.info("✓ Scheduled full UDI refresh completed")
@@ -266,6 +302,20 @@ def udi_refresh_processor_loop(
                 # the change ratio exceeds UDI_DELTA_FALLBACK_THRESHOLD.
                 logger.debug("UDI delta refresh tick...")
                 udi.refresh_delta()
+                if udi.consume_delta_assignment_signal():
+                    # Delta saw Dispatcharr stream add/delete: don't wait up
+                    # to 180 min for the scheduled slot — re-sync assignments
+                    # now and queue exactly the affected channels (no force:
+                    # only new streams probe, scrambles re-sort zero-probe).
+                    logger.info(
+                        "Delta saw Dispatcharr stream changes — "
+                        "running early assignment re-sync..."
+                    )
+                    _early_snap = udi.snapshot_channel_assignments()
+                    if udi.refresh_all():
+                        udi.queue_assignment_changed_channels(
+                            _early_snap, reason="delta-triggered-early-resync"
+                        )
 
         except Exception as exc:
             logger.error(f"Error in UDI refresh processor: {exc}", exc_info=True)

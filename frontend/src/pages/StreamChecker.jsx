@@ -1432,7 +1432,11 @@ export default function StreamChecker() {
                           id="stream_cache_ttl"
                           type="number"
                           value={editedConfig?.stream_cache?.ttl_hours ?? 48}
-                          onChange={(e) => updateConfigValue('stream_cache.ttl_hours', parseInt(e.target.value))}
+                          onChange={(e) => {
+                            const parsed = parseInt(e.target.value, 10)
+                            const safe = Number.isNaN(parsed) ? 48 : Math.min(720, Math.max(1, parsed))
+                            updateConfigValue('stream_cache.ttl_hours', safe)
+                          }}
                           disabled={!configEditing || editedConfig?.stream_cache?.enabled !== true}
                           min={1}
                           max={720}
