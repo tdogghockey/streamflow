@@ -3893,6 +3893,21 @@ class StreamCheckerService:
                         is_busy = is_account_busy(account, all_accounts)
                     if is_busy:
                         acct_name = account.get('name', 'unknown')
+                        _self_occupied = False
+                        try:
+                            from apps.stream.concurrent_stream_limiter import (
+                                get_account_limiter as _gal,
+                                own_in_flight_probes as _own,
+                            )
+                            _self_occupied = _own(_gal(), account.get('id')) > 0
+                        except Exception:
+                            _self_occupied = False
+                        if _self_occupied:
+                            logger.info(
+                                f"Channel {channel_id} account {acct_name} reports busy but we hold "
+                                "in-flight probes (self-occupation) — proceeding to normal slot acquire"
+                            )
+                            continue
                         logger.info(
                             f"Channel {channel_id} account {acct_name} is live-busy, "
                             "deferring concurrent probe"
@@ -9409,6 +9424,21 @@ class StreamCheckerService:
                         is_busy = is_account_busy(account, all_accounts)
                     if is_busy:
                         acct_name = account.get('name', 'unknown')
+                        _self_occupied = False
+                        try:
+                            from apps.stream.concurrent_stream_limiter import (
+                                get_account_limiter as _gal,
+                                own_in_flight_probes as _own,
+                            )
+                            _self_occupied = _own(_gal(), account.get('id')) > 0
+                        except Exception:
+                            _self_occupied = False
+                        if _self_occupied:
+                            logger.info(
+                                f"Channel {channel_id} account {acct_name} reports busy but we hold "
+                                "in-flight probes (self-occupation) — proceeding to normal slot acquire"
+                            )
+                            continue
                         logger.info(
                             f"Channel {channel_id} account {acct_name} is live-busy, "
                             "deferring single-channel probe"

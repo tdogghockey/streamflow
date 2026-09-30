@@ -510,6 +510,24 @@ class ReservedProfile(dict):
         self.authority_fingerprint = authority_fingerprint
 
 
+def own_in_flight_probes(account_limiter, account_id) -> int:
+    """Streams WE currently hold/check on this account (self-occupation check).
+
+    A provider-side "full" verdict that is fully explained by our own
+    in-flight probes must not trigger instant-skip/defer: our probes drain
+    in seconds, while a genuine viewer holds the slot for hours. Callers
+    should let the normal slot-acquire path wait out our own drain instead.
+    Fail-soft 0 (treat as genuine busy) whenever the count is unavailable.
+    """
+    try:
+        getter = getattr(account_limiter, 'get_checking_count', None)
+        if callable(getter):
+            return max(0, int(getter(account_id) or 0))
+    except Exception:
+        pass
+    return 0
+
+
 class AccountStreamLimiter:
     """
     Manages concurrent stream limits per M3U account.
@@ -944,7 +962,24 @@ class AccountStreamLimiter:
         # Available slots = limit - active streams - checking streams
         available = limit - active_count - checking_count
         return max(0, available)
-    
+
+    def get_checking_count(self, account_id: int) -> int:
+        """Streams WE are currently checking on this account.
+
+        Used by the live-busy verdict path to discount self-occupation: a
+        provider-side "full" verdict that is fully explained by our own
+        in-flight probes must not instant-skip/defer (our probes drain in
+        seconds; a genuine viewer holds the slot for hours). Fail-soft 0.
+        """
+        try:
+            normalized_account_id = _strict_positive_id(account_id)
+            if normalized_account_id is None:
+                return 0
+            with self.lock:
+                return max(0, int(self.account_checking_counts.get(normalized_account_id, 0)))
+        except Exception:
+            return 0
+
     def acquire(self, account_id: Optional[int], timeout: float = None) -> tuple[bool, str]:
         """
         Acquire permission to check a stream from the given account.
@@ -2673,7 +2708,14 @@ class SmartStreamScheduler:
                             set_account_live_busy,
                         )
                         if is_account_id_live_busy(account_id):
-                            return (False, 'provider_live_busy')
+                            if own_in_flight_probes(self.account_limiter, account_id) > 0:
+                                logger.debug(
+                                    "Provider reports account %s busy but we hold in-flight probes "
+                                    "(self-occupation) — proceeding to normal capacity check",
+                                    account_id,
+                                )
+                            else:
+                                return (False, 'provider_live_busy')
                         _udi_mgr = self.account_limiter.udi_manager
                         _all_accts = _udi_mgr.get_m3u_accounts() or []
                         _acct = next(
@@ -2691,7 +2733,14 @@ class SmartStreamScheduler:
                             and _acct.get('username')
                         ):
                             if is_account_busy(_acct, _all_accts, ttl=10):
-                                return (False, 'provider_live_busy')
+                                if own_in_flight_probes(self.account_limiter, account_id) > 0:
+                                    logger.debug(
+                                        "Provider probe reports account %s busy but we hold in-flight probes "
+                                        "(self-occupation) — proceeding to normal capacity check",
+                                        account_id,
+                                    )
+                                else:
+                                    return (False, 'provider_live_busy')
                             # Free again — clear a stale busy mark.
                             set_account_live_busy(account_id, False)
                     except Exception as e:
@@ -2915,7 +2964,14 @@ class SmartStreamScheduler:
                                     set_account_live_busy,
                                 )
                                 if is_account_id_live_busy(account_id):
-                                    can_run, reason = False, 'provider_live_busy'
+                                    if own_in_flight_probes(self.account_limiter, account_id) > 0:
+                                        logger.debug(
+                                            "Provider reports account %s busy but we hold in-flight probes "
+                                            "(self-occupation) — proceeding to normal slot acquire",
+                                            account_id,
+                                        )
+                                    else:
+                                        can_run, reason = False, 'provider_live_busy'
                                 else:
                                     _udi_mgr = self.account_limiter.udi_manager
                                     _all_accts = (
@@ -2938,7 +2994,14 @@ class SmartStreamScheduler:
                                         and _acct.get('username')
                                     ):
                                         if is_account_busy(_acct, _all_accts, ttl=10):
-                                            can_run, reason = False, 'provider_live_busy'
+                                            if own_in_flight_probes(self.account_limiter, account_id) > 0:
+                                                logger.debug(
+                                                    "Provider probe reports account %s busy but we hold in-flight probes "
+                                                    "(self-occupation) — proceeding to normal slot acquire",
+                                                    account_id,
+                                                )
+                                            else:
+                                                can_run, reason = False, 'provider_live_busy'
                                         else:
                                             # Free again — clear a stale mark.
                                             set_account_live_busy(account_id, False)
