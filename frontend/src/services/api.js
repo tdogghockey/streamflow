@@ -202,12 +202,13 @@ export const streamCheckerAPI = {
   updateConfig: (config) => api.put('/stream-checker/config', config),
   getProgress: () => api.get('/stream-checker/progress'),
   checkChannel: (channelId) => api.post('/stream-checker/check-channel', { channel_id: channelId }),
-  // Use longer timeout for single channel check as it can take time
+  // A single-channel check may refresh providers and probe many streams before
+  // replying. Keep the request open while the backend owns the check.
   checkSingleChannel: (channelId, profileId = null, forceCheck = true) => api.post('/stream-checker/check-single-channel', {
     channel_id: channelId,
     ...(profileId ? { profile_id: profileId } : {}),
     force_check: forceCheck,
-  }, { timeout: 120000 }),
+  }, { timeout: 0 }),
   checkStream: (streamIdOrPayload, options = {}, requestConfig = {}) => {
     const payloadProvided = typeof streamIdOrPayload === 'object'
     const payload = payloadProvided
@@ -315,6 +316,13 @@ export const dispatcharrAPI = {
   testConnection: (config) => api.post('/dispatcharr/test-connection', config),
   initializeUDI: () => api.post('/dispatcharr/initialize-udi', {}, { timeout: 120000 }),
   getInitializationStatus: () => api.get('/dispatcharr/initialization-status'),
+};
+
+// OpenStream monitoring: the API key Streamflow sends to OpenStream's control plane.
+export const openstreamAPI = {
+  getConfig: () => api.get('/openstream/config'),
+  updateConfig: (config) => api.put('/openstream/config', config),
+  testConnection: (config) => api.post('/openstream/test-connection', config),
 };
 
 export const sessionSettingsAPI = {
